@@ -3,119 +3,136 @@ import torch.nn as nn
 from torch import optim
 import torch.nn.functional as F
 import random
+from seq2seq.models import DecoderRNN, TopKDecoder
+from seq2seq.loss import NLLLoss
+from seq2seq.optim import Optimizer
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class RNNDecoderModule(nn.Module):
-    """LSTM RNN decoder NN module."""
-    def __init__(self, vocab_size, embedding_size, n_hidden):
-        super(RNNDecoderModule, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, embedding_size)
-        self.lstm = nn.LSTM(input_size=embedding_size, hidden_size=embedding_size,
-                            num_layers=n_hidden)
-        self.out = nn.Linear(embedding_size, vocab_size)
-        self.softmax = nn.LogSoftmax(dim=1)
-
-    def forward(self, input, hidden):
-        output = self.embedding(input).view(1, 1, -1)
-        output = F.relu(output)
-        output, hidden = self.lstm(output, hidden)
-        output = self.softmax(self.out(output[0]))
-        return output, hidden
-
 class RNNDecoder():
-    """RNN decoder class. Wraps the RNNDecoderModule."""
+    """RNN decoder class. Wraps the IBM seq2seq decoder (using GRU units)."""
     def __init__(self, vocab_size: int, embedding_size: int,
-                 n_hidden: int, sos_token: int = 0, eos_token: int = 1,
-                 max_output_length: int = 100) -> None:
-        self.decoder = RNNDecoderModule(vocab_size, embedding_size, n_hidden)
+                 n_hidden: int, sos_token: int = 0, eos_token: int = 1, mask_token: int = 2,
+                 max_output_length: int = 100, beam_size: int = 1, rnn_cell: str = 'lstm') -> None:
+        self.decoder = DecoderRNN(vocab_size, max_output_length, embedding_size,
+            n_layers=n_hidden, rnn_cell=rnn_cell, use_attention=False, bidirectional=False, eos_id=eos_token, sos_id=sos_token)
+        if beam_size > 1:
+            self.decoder = TopKDecoder(self.decoder, beam_size)
         if torch.cuda.is_available(): self.decoder.cuda()
+
+        self.rnn_cell = rnn_cell
+        self.beam_size = beam_size
         self.n_hidden = n_hidden
         self.embedding_size = embedding_size
         self.SOS_token = sos_token
         self.EOS_token = eos_token
+        self.mask_token = mask_token
         self.max_output_length = max_output_length
+        token_weights = torch.ones(vocab_size)
+        if torch.cuda.is_available(): token_weights=token_weights.cuda()
+        self.loss = NLLLoss(weight=token_weights, mask=mask_token)
+        self.optimizer = None
 
     def _create_init_hidden(self, embedding):
-        # TODO: maybe more of the cell/hidden states should be initialized
-        # as the sentence embedding for more redundancy.
-        # All hidden states except one start as zeros.
-        decoder_h = torch.zeros(self.n_hidden-1, 1, self.embedding_size)
-        decoder_h = torch.cat((embedding, decoder_h), 0)
-        # All cell states start as zeros.
-        decoder_c = torch.zeros(self.n_hidden, 1, self.embedding_size)
-        if torch.cuda.is_available():
-            decoder_c = decoder_c.cuda()
-            decoder_h = decoder_h.cuda()
-        return (decoder_h, decoder_c)
+        # All hidden states start as the embedding.
+        decoder_hidden = []
+        for i in range(self.n_hidden):
+            decoder_hidden.append(embedding)
+        # num_layers x batch_size x embedding_size
+        decoder_h = torch.cat(decoder_hidden, 0)
+        return decoder_h
 
-    def train(self, input_tensor, target_tensor, decoder_optimizer,
-              criterion, teacher_forcing_ratio=0.5):
-        """Train on a single sentence."""
-        # TODO: Implement batching.
-        decoder_optimizer.zero_grad()
-        target_length = target_tensor.size(0) # Target sequence length.
-        loss = 0
-        decoder_input = torch.tensor([[self.SOS_token]], device=device)
-        decoder_hidden = self._create_init_hidden(torch.reshape(input_tensor, (1, 1, -1)))
-        if torch.cuda.is_available(): target_tensor = target_tensor.cuda()
+    def train(self, input_tensor, target_tensor, teacher_forcing_ratio=0.5):
+        """Train for one batch."""
+        decoder_outputs, decoder_hidden, ret_dict = self.decoder(
+            inputs=target_tensor, encoder_hidden=input_tensor, teacher_forcing_ratio=teacher_forcing_ratio)
+        # Nothing was generated. This number (10) was arbitrarily chosen.
+        if len(decoder_outputs) == 0:
+            return 10
 
-        use_teacher_forcing = True if random.random() < teacher_forcing_ratio else False
-        if use_teacher_forcing:
-            # Teacher forcing: feed the target as the next input.
-            for i in range(target_length):
-                decoder_output, decoder_hidden = self.decoder(
-                    decoder_input, decoder_hidden)
-                loss += criterion(decoder_output, target_tensor[i])
-                decoder_input = target_tensor[i]  # Teacher forcing.
-        else:
-            # Without teacher forcing: use prediction as the next input.
-            for i in range(target_length):
-                decoder_output, decoder_hidden = self.decoder(
-                    decoder_input, decoder_hidden)
-                top_value, top_index = decoder_output.topk(1)
-                decoder_input = top_index.squeeze().detach()  # Detach from graph.
-                loss += criterion(decoder_output, target_tensor[i])
-                if decoder_input.item() == self.EOS_token:
-                    break
-
+        loss = self.loss
+        loss.reset()
+        for step, step_output in enumerate(decoder_outputs):
+            batch_size = target_tensor.size(0)
+            loss.eval_batch(step_output.contiguous().view(batch_size, -1), target_tensor[:, step + 1])
+        self.decoder.zero_grad()
         loss.backward()
-        decoder_optimizer.step()
-        return loss.item() / target_length
+        self.optimizer.step()
+        return loss.get_loss()
 
-    def train_iters(self, pairs, n_iters, print_every=1000, learning_rate=0.001):
+    def train_iters(self, pairs, n_iters, batch_size=64, print_every=1000, learning_rate=0.0002, teacher_forcing_ratio=0.5):
         """Train for some number of iterations choosing randomly from the list of tensor pairs."""
-        decoder_optimizer = optim.Adam(self.decoder.parameters(), lr=learning_rate)
-        criterion = nn.NLLLoss()
+        print("Initializing training.")
+        if self.optimizer == None:
+            adam = optim.Adam(self.decoder.parameters(), lr=learning_rate)
+            self.optimizer =  Optimizer(adam, max_grad_norm=5)
+        else:
+            print("Using existing optimizer.")
+        random.shuffle(pairs)
+        if (len(pairs) < batch_size):
+            print("Not enough examples for one batch.")
+            return
 
+        # Turn the pairs into big tensors.
+        # Input: num_layers x num_examples x embedding_size
+        # Target: num_examples x max_output_length+1
+        input_tensors = [ torch.reshape(i, (1, 1, -1)) for i, j in pairs ]
+        input_tensor = torch.cat(input_tensors, 1)
+        input_tensor = self._create_init_hidden(input_tensor)
+        target_tensors = [ j for i, j in pairs ]
+        targets = []
+        for target in target_tensors:
+            target_tensor = torch.reshape(target, (1,-1))
+            if target_tensor.size(1) >= self.max_output_length:
+                target_tensor = target_tensor[0][0:self.max_output_length]
+                target_tensor = torch.reshape(target_tensor, (1,-1))
+            else:
+                pad = torch.zeros(1, self.max_output_length-target_tensor.size(1)).long()
+                for i in range(self.max_output_length-target_tensor.size(1)):
+                    pad[0][i] = self.mask_token
+                target_tensor = torch.cat((target_tensor, pad), 1)
+            # Add the start token.
+            start_tensor = torch.zeros(1,1).long()
+            start_tensor[0][0] = self.SOS_token
+            target_tensor = torch.cat((start_tensor, target_tensor), 1)
+            targets.append(target_tensor)
+        target_tensor = torch.cat(targets, 0)
+
+        if torch.cuda.is_available(): target_tensor = target_tensor.cuda()
+        if torch.cuda.is_available(): input_tensor = input_tensor.cuda()
+
+        print("Starting training.")
         print_loss_total = 0  # Reset every print_every.
+        batch = 0
         for iter in range(n_iters):
-            # TODO: train through a random permutation of the examples instead of
-            # selecting random examples.
-            training_pair = random.choice(pairs)
-            input_tensor = training_pair[0]
-            target_tensor = training_pair[1]
+            # Create the batch.
+            if (batch+1)*batch_size > len(pairs):
+                print("Finished an epoch!")
+                batch = 0
+            batch_input = input_tensor[:,batch*batch_size:(batch+1)*batch_size,:].contiguous()
+            batch_target = target_tensor[batch*batch_size:(batch+1)*batch_size,:].contiguous()
 
-            loss = self.train(input_tensor, target_tensor, decoder_optimizer, criterion)
+            if self.rnn_cell == 'lstm':
+                batch_input = (batch_input, batch_input)
+
+            loss = self.train(batch_input, batch_target, teacher_forcing_ratio=teacher_forcing_ratio)
             print_loss_total += loss
 
             if iter % print_every == print_every-1:
                 print_loss_avg = print_loss_total / print_every
                 print_loss_total = 0
-                print('Examples: {0}\nAverage loss: {1}'.format(iter, print_loss_avg))
+                print('Steps: {0}\nAverage loss: {1}'.format(iter, print_loss_avg))
+            batch += 1
 
     def predict(self, input_tensor):
         with torch.no_grad():
-            decoder_input = torch.tensor([[self.SOS_token]], device=device)
             decoder_hidden = self._create_init_hidden(torch.reshape(input_tensor, (1, 1, -1)))
-            decoded_seq = []
-            for i in range(self.max_output_length):
-                decoder_output, decoder_hidden = self.decoder(
-                    decoder_input, decoder_hidden)
-                top_value, top_index = decoder_output.topk(1)
-                decoder_input = top_index.squeeze().detach()  # Detach from graph.
-                if top_index.item() == self.EOS_token:
-                    break
-                else:
-                    decoded_seq.append(top_index.item())
-        return decoded_seq
+            if torch.cuda.is_available(): decoder_hidden = decoder_hidden.cuda()
+            if self.rnn_cell == 'lstm':
+                decoder_hidden = (decoder_hidden, decoder_hidden)
+            decoder_outputs, decoder_hidden, ret_dict = self.decoder(
+                inputs=None, encoder_hidden=decoder_hidden, teacher_forcing_ratio=0)
+        output_sequence = []
+        for item in ret_dict['sequence']:
+            output_sequence.append(item[0].item())
+        return output_sequence
