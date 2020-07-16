@@ -4,6 +4,7 @@ from collections import Counter
 from rnn_decoder import RNNDecoder
 from vanilla_rnn_decoder import VanillaRNNDecoder
 import pickle
+import time
 
 class SentenceGenerator:
     """
@@ -35,20 +36,23 @@ class SentenceGenerator:
         tokenized_sentence = []
         for item in decoded_seq:
             tokenized_sentence.append(self._index2token[item])
-        return self._detokenize_fn(tokenized_sentence)
+        detokenized_sentence = self._detokenize_fn(tokenized_sentence)
+        # In case OpenNMT BPE detokenization is not included in the detokenize function.
+        return detokenized_sentence.replace("@@ ", "")
 
     def train_generator(self, training_sentences: list, iters: int,
-                        vocab_size: int = 15000, pickled_pairs: str = "",
+                        vocab_size: int = 30000, pickled_pairs: str = "",
+                        pickled_shards: list = [],
                         pickled_vocab: str = "", batch_size: int = 64,
                         learning_rate: float = 0.0002, n_layers: int = 4,
-                        max_output_length: int = 20, print_every: int = 1000,
-                        beam_size: int = 1, rnn_cell: str = 'lstm') -> None:
+                        max_output_length: int = 100, print_every: int = 1000,
+                        rnn_cell: str = 'lstm') -> None:
         """
         Trains an RNN decoder. Overrides the existing decoder.
         Either provide a list of training sentences (strings), or the pickled
         vocab and pickled training pairs.
         """
-        if pickled_pairs == "" and len(training_sentences) == 0:
+        if len(pickled_shards) == 0 and pickled_pairs == "" and len(training_sentences) == 0:
             print("No training sentences provided.")
             return
         if iters == 0:
@@ -58,11 +62,12 @@ class SentenceGenerator:
         if self._n_tokens == 0:
             if pickled_vocab == "":
                 print("Creating vocabulary.")
+                if len(training_sentences) == 0:
+                    print("Cannot create vocabulary without input sentences.")
+                    return
                 token_counts = {}
-                tokenized_sentences = []
                 for sentence in training_sentences:
                     tokenized_sentence = self._tokenize_fn(sentence)
-                    tokenized_sentences.append(tokenized_sentence)
                     for token in tokenized_sentence:
                         if token not in token_counts:
                             token_counts[token] = 1
@@ -85,13 +90,37 @@ class SentenceGenerator:
                 print("Loading pickled vocabulary.")
                 self._token2index, self._index2token, self._n_tokens = pickle.load(open(pickled_vocab, "rb"))
 
+        # Special case using shards.
+        if len(pickled_shards) > 0:
+            if self._decoder == None:
+                print("Instantiating new RNN.")
+                training_pairs = pickle.load(open(pickled_shards[0], "rb"))
+                self._embedding_size = training_pairs[0][0].nelement()
+                self._decoder = RNNDecoder(self._n_tokens, self._embedding_size, n_layers, max_output_length=max_output_length, rnn_cell=rnn_cell)
+            else:
+                print("Resuming training.")
+            for i in range(iters): # iters now means the number of epochs through the training data.
+                print("Starting epoch {}".format(i))
+                for pickled_pairs in pickled_shards:
+                    training_pairs = None
+                    time.sleep(10) # Wait 10 seconds, hope garbage collection is done...
+                    print("Loading shard: {}".format(pickled_pairs))
+                    training_pairs = pickle.load(open(pickled_pairs, "rb"))
+                    print("Training on shard.")
+                    num_steps = len(training_pairs)//batch_size
+                    self._decoder.train_iters(training_pairs, num_steps, batch_size=batch_size, print_every=print_every)
+                    print("Finished shard.")
+            print("Finished {} epochs!".format(iters))
+            return
+
+        # Otherwise, use pickled pairs or provided sentences.
         # Create the training pairs.
         if pickled_pairs == "":
             print("Creating training pairs.")
             training_pairs = []
             for sent_i in range(len(training_sentences)):
                 # Each target tensor will have an end token, but no start token.
-                tokenized_sentence = tokenized_sentences[sent_i]
+                tokenized_sentence =  self._tokenize_fn(training_sentences[sent_i])
                 target_tensor = torch.zeros(len(tokenized_sentence)+1, 1).long()
                 for tok_i in range(len(tokenized_sentence)):
                     if tokenized_sentence[tok_i] in self._token2index:
@@ -114,5 +143,5 @@ class SentenceGenerator:
         # Train the RNN.
         print("Training RNN.")
         self._embedding_size = training_pairs[0][0].nelement()
-        self._decoder = RNNDecoder(self._n_tokens, self._embedding_size, n_layers, max_output_length=max_output_length, beam_size=beam_size, rnn_cell=rnn_cell)
+        self._decoder = RNNDecoder(self._n_tokens, self._embedding_size, n_layers, max_output_length=max_output_length, rnn_cell=rnn_cell)
         self._decoder.train_iters(training_pairs, iters, batch_size=batch_size, print_every=print_every, learning_rate=learning_rate)

@@ -10,18 +10,15 @@ from seq2seq.optim import Optimizer
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class RNNDecoder():
-    """RNN decoder class. Wraps the IBM seq2seq decoder (using GRU units)."""
+    """RNN decoder class. Wraps the IBM seq2seq decoder (using GRU or LSTM units)."""
     def __init__(self, vocab_size: int, embedding_size: int,
                  n_hidden: int, sos_token: int = 0, eos_token: int = 1, mask_token: int = 2,
-                 max_output_length: int = 100, beam_size: int = 1, rnn_cell: str = 'lstm') -> None:
+                 max_output_length: int = 100, rnn_cell: str = 'lstm') -> None:
         self.decoder = DecoderRNN(vocab_size, max_output_length, embedding_size,
             n_layers=n_hidden, rnn_cell=rnn_cell, use_attention=False, bidirectional=False, eos_id=eos_token, sos_id=sos_token)
-        if beam_size > 1:
-            self.decoder = TopKDecoder(self.decoder, beam_size)
         if torch.cuda.is_available(): self.decoder.cuda()
 
         self.rnn_cell = rnn_cell
-        self.beam_size = beam_size
         self.n_hidden = n_hidden
         self.embedding_size = embedding_size
         self.SOS_token = sos_token
@@ -74,6 +71,7 @@ class RNNDecoder():
             return
 
         # Turn the pairs into big tensors.
+        # TODO: instead of saving pairs, save tensors directly. Otherwise this operation takes too much space.
         # Input: num_layers x num_examples x embedding_size
         # Target: num_examples x max_output_length+1
         input_tensors = [ torch.reshape(i, (1, 1, -1)) for i, j in pairs ]
@@ -124,13 +122,17 @@ class RNNDecoder():
                 print('Steps: {0}\nAverage loss: {1}'.format(iter, print_loss_avg))
             batch += 1
 
-    def predict(self, input_tensor):
+    def predict(self, input_tensor, beam_size: int = 5):
+        if beam_size > 1:
+            beam_decoder = TopKDecoder(self.decoder, beam_size)
+        else:
+            beam_decoder = self.decoder
         with torch.no_grad():
             decoder_hidden = self._create_init_hidden(torch.reshape(input_tensor, (1, 1, -1)))
             if torch.cuda.is_available(): decoder_hidden = decoder_hidden.cuda()
             if self.rnn_cell == 'lstm':
                 decoder_hidden = (decoder_hidden, decoder_hidden)
-            decoder_outputs, decoder_hidden, ret_dict = self.decoder(
+            decoder_outputs, decoder_hidden, ret_dict = beam_decoder(
                 inputs=None, encoder_hidden=decoder_hidden, teacher_forcing_ratio=0)
         output_sequence = []
         for item in ret_dict['sequence']:
