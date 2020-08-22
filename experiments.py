@@ -72,9 +72,11 @@ def diff_embedding(start_sent: str, end_sent: str, new_start_sent: str):
 def scale_embedding(sent: str, end_magnitude: float = 25, num_steps: int = 20):
     global embeddings
     emb = embedding_fn(sent)
+    original_magnitude = np.sqrt(emb.dot(emb))
+    unit_emb = emb/original_magnitude
     embeddings = []
     for i in range(num_steps+1):
-        embeddings.append(emb*end_magnitude*i/num_steps)
+        embeddings.append(unit_emb*end_magnitude*i/num_steps)
 
 # ------------------------------------------------------------------------------
 # Run experiments.
