@@ -152,7 +152,7 @@ class TopKDecoder(torch.nn.Module):
             sequence_scores = scores.view(batch_size * self.k, 1)
 
             # Update fields for next timestep
-            predecessors = (candidates / self.V + self.pos_index.expand_as(candidates)).view(batch_size * self.k, 1)
+            predecessors = (candidates // self.V + self.pos_index.expand_as(candidates)).view(batch_size * self.k, 1)
             if isinstance(hidden, tuple):
                 hidden = tuple([h.index_select(1, predecessors.squeeze()) for h in hidden])
             else:
@@ -161,7 +161,7 @@ class TopKDecoder(torch.nn.Module):
             # Update sequence scores and erase scores for end-of-sentence symbol so that they aren't expanded
             stored_scores.append(sequence_scores.clone())
             eos_indices = input_var.data.eq(self.EOS)
-            if eos_indices.nonzero().dim() > 0:
+            if torch.nonzero(eos_indices, as_tuple=False).dim() > 0:
                 sequence_scores.data.masked_fill_(eos_indices, -float('inf'))
 
             # Cache results for backtracking
@@ -283,14 +283,14 @@ class TopKDecoder(torch.nn.Module):
             #       2. Otherwise, replace the ended sequence with the lowest sequence
             #       score with the new ended sequence
             #
-            eos_indices = symbols[t].data.squeeze(1).eq(self.EOS).nonzero()
+            eos_indices = torch.nonzero(symbols[t].data.squeeze(1).eq(self.EOS), as_tuple=False)
             if eos_indices.dim() > 0:
                 for i in range(eos_indices.size(0)-1, -1, -1):
                     # Indices of the EOS symbol for both variables
                     # with b*k as the first dimension, and b, k for
                     # the first two dimensions
                     idx = eos_indices[i]
-                    b_idx = int(idx[0] / self.k)
+                    b_idx = int(idx[0] // self.k)
                     # The indices of the replacing position
                     # according to the replacement strategy noted above
                     res_k_idx = self.k - (batch_eos_found[b_idx] % self.k) - 1

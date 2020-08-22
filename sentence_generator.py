@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 from collections import Counter
 from rnn_decoder import RNNDecoder
 from vanilla_rnn_decoder import VanillaRNNDecoder
@@ -31,14 +32,39 @@ class SentenceGenerator:
     def get_embedding(self, sentence: str) -> torch.FloatTensor:
         return self._embedding_fn(sentence)
 
-    def get_sentence(self, embedding: torch.FloatTensor) -> str:
-        decoded_seq = self._decoder.predict(torch.from_numpy(embedding))
+    # Gets a sentence for the embedding by sampling nearby embeddings, outputting
+    # the sample with maximum similarity between the target embedding and
+    # Embedding(Sentence(sample)).
+    def get_sentence(self, embedding: torch.FloatTensor, min_num_noise_samples: int = 10,
+                     max_num_noise_samples: int = 100, threshold: float = 0.90,
+                     variance: float = 0.02, beam_size: int = 10) -> str:
+        noise_samples = np.random.multivariate_normal(np.zeros(self._embedding_size), variance*np.identity(self._embedding_size), max_num_noise_samples)
+        noise_samples = np.float32(noise_samples)
+        max_sim = -1
+        best_sent = ""
+        for i in range(max_num_noise_samples):
+            noisy_emb = embedding + noise_samples[i]
+            sample_sent = self.get_sentence_no_noise(noisy_emb, beam_size = beam_size)
+            sample_emb = self.get_embedding(sample_sent)
+            sample_sim = cosine_similarity([embedding], [sample_emb])[0].item()
+            if sample_sim > max_sim:
+                max_sim = sample_sim
+                best_sent = sample_sent
+            if max_sim > threshold and i >= min_num_noise_samples:
+                return best_sent
+        return best_sent
+
+    # Gets the sentence decoded from a given embedding.
+    def get_sentence_no_noise(self, embedding: torch.FloatTensor, beam_size: int) -> str:
+        decoded_seq = self._decoder.predict(torch.from_numpy(embedding), beam_size=beam_size)
         tokenized_sentence = []
         for item in decoded_seq:
+            if item == 1: # EOS token.
+                break
             tokenized_sentence.append(self._index2token[item])
         detokenized_sentence = self._detokenize_fn(tokenized_sentence)
         # In case OpenNMT BPE detokenization is not included in the detokenize function.
-        return detokenized_sentence.replace("@@ ", "")
+        return detokenized_sentence.replace("@@ ", "").replace("@@", "")
 
     def train_generator(self, training_sentences: list, iters: int,
                         vocab_size: int = 30000, pickled_pairs: str = "",
@@ -46,6 +72,7 @@ class SentenceGenerator:
                         pickled_vocab: str = "", batch_size: int = 64,
                         learning_rate: float = 0.0002, n_layers: int = 4,
                         max_output_length: int = 100, print_every: int = 1000,
+                        teacher_forcing_ratio: float = 0.5,
                         rnn_cell: str = 'lstm') -> None:
         """
         Trains an RNN decoder. Overrides the existing decoder.
@@ -115,7 +142,7 @@ class SentenceGenerator:
 
         # Otherwise, use pickled pairs or provided sentences.
         # Create the training pairs.
-        if pickled_pairs == "":
+        if pickled_pairs == "": # Only use the provided sentences if no pickled pairs.
             print("Creating training pairs.")
             training_pairs = []
             for sent_i in range(len(training_sentences)):
@@ -144,4 +171,4 @@ class SentenceGenerator:
         print("Training RNN.")
         self._embedding_size = training_pairs[0][0].nelement()
         self._decoder = RNNDecoder(self._n_tokens, self._embedding_size, n_layers, max_output_length=max_output_length, rnn_cell=rnn_cell)
-        self._decoder.train_iters(training_pairs, iters, batch_size=batch_size, print_every=print_every, learning_rate=learning_rate)
+        self._decoder.train_iters(training_pairs, iters, batch_size=batch_size, print_every=print_every, learning_rate=learning_rate, teacher_forcing_ratio=teacher_forcing_ratio)

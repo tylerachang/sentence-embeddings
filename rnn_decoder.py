@@ -122,7 +122,7 @@ class RNNDecoder():
                 print('Steps: {0}\nAverage loss: {1}'.format(iter, print_loss_avg))
             batch += 1
 
-    def predict(self, input_tensor, beam_size: int = 5):
+    def predict(self, input_tensor, beam_size: int):
         if beam_size > 1:
             beam_decoder = TopKDecoder(self.decoder, beam_size)
         else:

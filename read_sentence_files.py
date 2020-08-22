@@ -1,5 +1,7 @@
 """
 Reads sentences from files.
+Reads each file into a string, then uses nltk sentence segmentation. Originally
+used for the gutenberg dataset.
 """
 
 from __future__ import unicode_literals
